@@ -2265,8 +2265,85 @@ function extractWaterLevelSeries_NAVD88(json){
 }
 
 async function fetchObservedSeries({startISO=null,endISO=null,period=null}={}){
-  const j = await fetchIV({startISO,endISO,period});
-  return extractWaterLevelSeries_NAVD88(j);
+  /*
+    Robust USGS IV wrapper.
+
+    Why this exists:
+    - The dashboard needs current-year data, but a single Jan 1 -> today IV request
+      can fail once the year gets long enough.
+    - When that failed, updateLiveAndAnnualCounts() rejected and the UI showed
+      "LIVE DATA UNAVAILABLE" even though shorter USGS requests still worked.
+    - This wrapper splits long start/end ranges into smaller chunks and merges them.
+  */
+
+  // Simple/short path: period requests or missing start/end stay unchanged.
+  if(period || !startISO || !endISO){
+    const j = await fetchIV({startISO,endISO,period});
+    return extractWaterLevelSeries_NAVD88(j);
+  }
+
+  const startMs = new Date(startISO).getTime();
+  const endMs   = new Date(endISO).getTime();
+
+  if(!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs){
+    const j = await fetchIV({startISO,endISO});
+    return extractWaterLevelSeries_NAVD88(j);
+  }
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const rangeDays = (endMs - startMs) / DAY_MS;
+
+  // Keep normal short requests as one call.
+  if(rangeDays <= 28){
+    const j = await fetchIV({startISO,endISO});
+    return extractWaterLevelSeries_NAVD88(j);
+  }
+
+  // Split longer ranges into 21-day chunks. This is safer for USGS IV.
+  const CHUNK_DAYS = 21;
+  const CHUNK_MS = CHUNK_DAYS * DAY_MS;
+  const all = [];
+  const errors = [];
+
+  for(let a = startMs; a < endMs; a += CHUNK_MS){
+    const b = Math.min(a + CHUNK_MS, endMs);
+
+    try{
+      const j = await fetchIV({
+        startISO: new Date(a).toISOString(),
+        endISO:   new Date(b).toISOString()
+      });
+
+      const pts = extractWaterLevelSeries_NAVD88(j);
+      all.push(...pts);
+    }catch(e){
+      // Do not kill the whole dashboard because one chunk failed.
+      console.warn("USGS IV chunk failed:", new Date(a).toISOString(), new Date(b).toISOString(), e);
+      errors.push(e);
+    }
+  }
+
+  // De-dupe + sort by timestamp.
+  const byTime = new Map();
+  for(const p of all){
+    if(!p?.t || !Number.isFinite(Number(p.ft))) continue;
+    byTime.set(new Date(p.t).toISOString(), { t:new Date(p.t).toISOString(), ft:Number(p.ft) });
+  }
+
+  const merged = Array.from(byTime.values())
+    .sort((a,b)=>new Date(a.t) - new Date(b.t));
+
+  if(merged.length) return merged;
+
+  // Last-resort fallback for the live card/chart: recent data only.
+  // This prevents the whole UI from saying unavailable when historical chunks fail.
+  try{
+    const j = await fetchIV({ period:"P7D" });
+    return extractWaterLevelSeries_NAVD88(j);
+  }catch(e){
+    if(errors.length) throw errors[0];
+    throw e;
+  }
 }
 
 /* =========================
@@ -3968,7 +4045,17 @@ async function updateLiveAndAnnualCounts(){
 curFtEl.textContent = toDisplayFtFromNavd(STATE.lastNavd.ft).toFixed(2);
 curMetaEl.textContent = "Updated: " + fmtESTFull(STATE.lastNavd.t);
 lastPill.textContent  = "Last updated: " + fmtESTFull(STATE.lastNavd.t);
-setStage(STATE.lastNavd.ft);
+
+// If the gauge has stopped reporting recently, do NOT call this "unavailable";
+// show the latest available observation and make the header honest.
+const latestAgeMs = Date.now() - new Date(STATE.lastNavd.t).getTime();
+if(Number.isFinite(latestAgeMs) && latestAgeMs > 6 * 3600 * 1000){
+  stageTextEl.textContent = "LATEST USGS OBSERVATION";
+  stageDotEl.style.background = "var(--muted)";
+  stageDotEl.style.boxShadow = "0 0 0 4px rgba(169,182,211,.14)";
+}else{
+  setStage(STATE.lastNavd.ft);
+}
 setCurrentNumberColorByNavd(STATE.lastNavd.ft);
   // ---- Daily range (today) ----
 // ---- Daily range (today) ----
@@ -4368,7 +4455,7 @@ if (hist[0].status === "rejected") {
   const live = await Promise.allSettled([ updateLiveAndAnnualCounts() ]);
   if(live[0].status === "rejected"){
     console.error("Live init failed:", live[0].reason);
-    stageTextEl.textContent="LIVE DATA UNAVAILABLE";
+    stageTextEl.textContent="USGS LIVE DATA TEMPORARILY UNAVAILABLE";
     lastPill.textContent="Last updated: —";
     curFtEl.textContent="—";
     curMetaEl.textContent="Updated: —";
@@ -4478,7 +4565,7 @@ if(STATE.todayNavd && STATE.todayNavd.length){
 /* Start */
 boot().catch(err=>{
   console.error(err);
-  stageTextEl.textContent="LIVE DATA UNAVAILABLE";
+  stageTextEl.textContent="USGS LIVE DATA TEMPORARILY UNAVAILABLE";
   lastPill.textContent="Last updated: —";
 });
 
